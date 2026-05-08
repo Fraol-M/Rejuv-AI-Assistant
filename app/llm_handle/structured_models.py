@@ -5,7 +5,7 @@ These models replace fragile `json.loads()` parsing with type-safe
 Pydantic validation, used with `LangChainLLM.generate_structured()`.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 
 
@@ -37,6 +37,15 @@ class ExecutionStep(BaseModel):
         default="informative",
         description="'informative' for existing agents, 'action' for E2B sandbox execution"
     )
+
+    @field_validator("dependency", mode="before")
+    @classmethod
+    def normalize_dependency(cls, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, int):
+            return [value]
+        return value
 
 
 class ExecutionGroup(BaseModel):

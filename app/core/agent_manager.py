@@ -26,11 +26,11 @@ from ..agent_hub.hypothesis_generation.hypothesis import HypothesisGeneration
 from ..realtime.socket_manager import emit_to_user
 from ..agent_hub.Galaxy_integration.galaxy import GalaxyHandler
 from ..agent_hub.biogpt_agent.biogpt import BioGPTAgent
-from ..e2b.executor import E2BExecutor
-from ..e2b.critic import CriticAgent
-from ..e2b.code_generator import CodeGenerator
-from ..e2b.session_manager import session_manager
-from ..e2b.artifact_handler import ArtifactHandler
+from ..action_manager.backends import ActionSandboxRunner
+from ..action_manager.critic import CriticAgent
+from ..action_manager.code_generator import CodeGenerator
+from ..action_manager.session_manager import session_manager
+from ..action_manager.artifact_handler import ArtifactHandler
 from ..utils import RichLogger
 from typing import TypedDict, List, Annotated, Any, Dict, Optional
 from flask_socketio import emit
@@ -102,7 +102,7 @@ class AgentManager:
         self.hypothesis_generation = HypothesisGeneration(advanced_llm)
         self.galaxy_handler = GalaxyHandler(advanced_llm, qdrant_client, embedding_model)
         self.biogpt = BioGPTAgent(llm=advanced_llm)
-        self.e2b_executor_client = E2BExecutor()
+        self.action_sandbox_runner = ActionSandboxRunner()
         self.e2b_critic = CriticAgent()
         self.e2b_code_generator = CodeGenerator(advanced_llm)
         self.e2b_artifact_handler = ArtifactHandler()
@@ -196,48 +196,6 @@ class AgentManager:
                 "plan": [],
                 "execution_groups": [],
                 "messages": [AIMessage(content=refusal)]
-            }
-
-        # Hard-route genotype tool/QC requests to E2B when genotype files are uploaded.
-        # This avoids LLM planner drift to non-execution agents (e.g., galaxy_agent).
-        uploaded_files = session_manager.get_uploaded_files(user_id)
-        has_genotype_upload = any(
-            str(file_meta.get("filename", "")).lower().endswith(
-                (".vcf", ".vcf.gz", ".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam")
-            )
-            for file_meta in uploaded_files
-        )
-        query_lower = (query or "").lower()
-        action_pattern = re.compile(
-            r"\b(qc|quality control|plink|maf|hwe|missing(?:ness)?|filter|run|compute|summary|pca|gwas|assoc)\b"
-        )
-        wants_action = bool(action_pattern.search(query_lower))
-
-        if has_genotype_upload and wants_action:
-            forced_groups = [{
-                "group_id": 1,
-                "mode": "sequential",
-                "steps": [
-                    {
-                        "id": 1,
-                        "agent": "e2b_executor",
-                        "input": query,
-                        "dependency": None,
-                    },
-                ],
-            }]
-            logger.info("Forcing E2B execution plan due to genotype upload + action-oriented query.")
-            return {
-                "plan": forced_groups[0]["steps"],
-                "execution_groups": forced_groups,
-                "current_group_index": 0,
-                "current_step_in_group": 0,
-                "current_step_index": 0,
-                "step_input": query,
-                "step_outputs": {},
-                "agents_to_run": ["e2b_executor"],
-                "agent_errors": {},
-                "messages": [HumanMessage(content="Forced E2B plan generated for genotype action query")],
             }
 
         # --- STEP 2: PLANNING (structured output) ---
@@ -337,6 +295,12 @@ class AgentManager:
                 logger.info("Removing content_retrieval_agent from plan because no context sources were provided")
             execution_groups = sanitized_groups
 
+        execution_groups = self._ensure_action_step_when_needed(
+            execution_groups=execution_groups,
+            query=query,
+            user_id=user_id,
+        )
+
         all_steps = []
         for group in execution_groups:
             all_steps.extend(group.get("steps", []))
@@ -371,6 +335,100 @@ class AgentManager:
             "agent_errors": {},
             "messages": [HumanMessage(content=f"Plan generated with {len(execution_groups)} groups, {len(all_steps)} total steps")]
         }
+
+    def _ensure_action_step_when_needed(
+        self,
+        execution_groups: list[dict],
+        query: str,
+        user_id: str,
+    ) -> list[dict]:
+        """
+        Let the planner lead, but guard obvious action requests.
+
+        If uploaded action files exist and the planner forgot E2B for a clear
+        compute/run/plot/filter task, inject E2B as the first sequential step.
+        """
+        if not self._query_needs_action(query):
+            return execution_groups
+
+        uploaded_files = session_manager.get_uploaded_files(user_id)
+        if not uploaded_files:
+            return execution_groups
+
+        all_steps = [
+            step
+            for group in execution_groups
+            for step in group.get("steps", [])
+        ]
+        if any(step.get("agent") == "e2b_executor" for step in all_steps):
+            return execution_groups
+
+        logger.info("Injecting E2B action step because uploaded files + action query were detected")
+
+        action_step = {
+            "id": self._next_step_id(execution_groups),
+            "agent": "e2b_executor",
+            "input": query,
+            "dependency": None,
+            "track": "action",
+        }
+        action_group = {
+            "group_id": self._next_group_id(execution_groups),
+            "mode": "sequential",
+            "steps": [action_step],
+        }
+
+        if not execution_groups:
+            return [action_group]
+
+        adjusted_groups = [action_group]
+        action_id = action_step["id"]
+        for group in execution_groups:
+            adjusted_group = dict(group)
+            adjusted_steps = []
+            for step in group.get("steps", []):
+                adjusted_step = dict(step)
+                dependencies = adjusted_step.get("dependency")
+                if not dependencies:
+                    adjusted_step["dependency"] = [action_id]
+                adjusted_steps.append(adjusted_step)
+            adjusted_group["steps"] = adjusted_steps
+            adjusted_groups.append(adjusted_group)
+
+        return adjusted_groups
+
+    @staticmethod
+    def _query_needs_action(query: str) -> bool:
+        action_pattern = re.compile(
+            r"\b("
+            r"run|execute|compute|calculate|plot|chart|visuali[sz]e|"
+            r"filter|clean|convert|transform|extract|parse|download|"
+            r"qc|quality control|missing(?:ness)?|statistics|stats|"
+            r"plink|plink2|samtools|bcftools|pysam|gwas|pca|assoc|"
+            r"fasta|fastq|vcf|bam|sam|csv|tsv"
+            r")\b",
+            re.IGNORECASE,
+        )
+        return bool(action_pattern.search(query or ""))
+
+    @staticmethod
+    def _next_step_id(execution_groups: list[dict]) -> int:
+        step_ids = [
+            int(step.get("id", 0))
+            for group in execution_groups
+            for step in group.get("steps", [])
+            if str(step.get("id", "")).isdigit()
+        ]
+        return max(step_ids, default=0) + 1
+
+    @staticmethod
+    def _next_group_id(execution_groups: list[dict]) -> int:
+        group_ids = [
+            int(group.get("group_id", 0))
+            for group in execution_groups
+            if str(group.get("group_id", "")).isdigit()
+        ]
+        return max(group_ids, default=0) + 1
 
 
     
@@ -715,40 +773,28 @@ class AgentManager:
         emit_to_user(user=user_id, message="Running code in E2B sandbox...")
         RichLogger.log_agent_start("e2b_executor", 0, 1)
 
-        # Reuse sandbox across follow-up queries for the same user
-        sandbox = session_manager.get_or_create(user_id)
-        if sandbox is None:
-            error_message = (
-                "E2B sandbox is unavailable. Check that the E2B SDK is installed and "
-                "that an E2B API key is configured."
-            )
-            logger.error(error_message)
-            return {
-                "e2b_response": {
-                    "text": f"[{error_message}]",
-                    "failed": True,
-                    "source": "E2B Sandbox",
-                },
-                "agent_errors": {"e2b_executor": error_message},
-                "agents_completed": ["e2b_executor"],
-                "messages": [AIMessage(content="E2B execution failed")],
-            }
-
+        uploaded_files = session_manager.get_uploaded_files(user_id)
+        sandbox = None
         pending_files = session_manager.get_unsynced_files(user_id)
         synced_files = []
         sync_errors = []
-        if pending_files:
-            synced_files, sync_errors = self.e2b_artifact_handler.sync_uploaded_files(
-                sandbox,
-                pending_files,
-            )
-            if synced_files:
-                session_manager.mark_files_synced(
-                    user_id,
-                    [file_meta["sandbox_path"] for file_meta in synced_files],
+        if self.action_sandbox_runner.primary == "e2b":
+            # Reuse E2B across follow-up queries. Docker fallback remains stateless.
+            sandbox = session_manager.get_or_create(user_id)
+            if sandbox is not None and pending_files:
+                synced_files, sync_errors = self.e2b_artifact_handler.sync_uploaded_files(
+                    sandbox,
+                    pending_files,
                 )
+                if synced_files:
+                    session_manager.mark_files_synced(
+                        user_id,
+                        [file_meta["sandbox_path"] for file_meta in synced_files],
+                    )
+            elif sandbox is None:
+                sync_errors = ["E2B sandbox is unavailable; Docker fallback may be used."]
 
-        available_files = session_manager.get_synced_files(user_id)
+        available_files = session_manager.get_synced_files(user_id) if sandbox else uploaded_files
         task_for_generation = self._build_e2b_task(task, available_files)
 
         error_context = None
@@ -764,13 +810,20 @@ class AgentManager:
                 error_context=error_context,
                 available_files=available_files,
             )
-            result = self.e2b_executor_client.run(code, sandbox=sandbox)
+            result = self.action_sandbox_runner.run(
+                code,
+                e2b_sandbox=sandbox,
+                uploaded_files=uploaded_files,
+            )
             is_valid, reason = self.e2b_critic.validate(result)
 
             if is_valid:
                 plots = self.e2b_artifact_handler.extract_plots(result)
                 stdout = result.get("stdout", "")
-                action_files = self.e2b_artifact_handler.list_files(sandbox)
+                action_files = result.get("files") or (
+                    self.e2b_artifact_handler.list_files(sandbox) if sandbox else []
+                )
+                backend = result.get("backend", "action sandbox")
 
                 # Build human-readable summary: first 800 chars of stdout
                 summary = stdout[:800].strip() or "Code executed successfully (see plots/files)."
@@ -781,7 +834,15 @@ class AgentManager:
                         "text": summary,
                         "stdout": stdout,
                         "plots": plots,          # list of base64 PNG strings
-                        "source": "E2B Sandbox",
+                        "json_format": {
+                            "type": "action_result",
+                            "stdout": stdout,
+                            "plots": plots,
+                            "files": action_files,
+                            "backend": backend,
+                            "fallback_from": result.get("fallback_from"),
+                        },
+                        "source": f"{backend} sandbox",
                     },
                     "action_files": action_files,
                     "agents_completed": ["e2b_executor"],
@@ -797,13 +858,17 @@ class AgentManager:
             RichLogger.log_error("E2B Executor", f"Attempt {attempt + 1} failed: {reason}")
 
             e2b_error = str(result.get("error", "") or result.get("stderr", "")).lower()
-            if "port is not open" in e2b_error or "bad gateway" in e2b_error:
+            if result.get("backend") == "e2b" and (
+                "port is not open" in e2b_error or "bad gateway" in e2b_error
+            ):
                 logger.warning("E2B sandbox execution port unavailable; resetting sandbox and resyncing files")
                 session_manager.reset_sandbox(user_id)
                 sandbox = session_manager.get_or_create(user_id)
                 if sandbox is None:
-                    error_context = "E2B sandbox reset failed; could not create a replacement sandbox."
-                    break
+                    sync_errors = ["E2B sandbox reset failed; Docker fallback may be used."]
+                    available_files = uploaded_files
+                    task_for_generation = self._build_e2b_task(task, available_files)
+                    continue
 
                 pending_files = session_manager.get_unsynced_files(user_id)
                 synced_files, sync_errors = self.e2b_artifact_handler.sync_uploaded_files(
@@ -952,6 +1017,8 @@ class AgentManager:
                     "source": "E2B Sandbox",
                     "content": text_content,
                 })
+            if e2b_resp.get("json_format") and json_format is None:
+                json_format = e2b_resp.get("json_format")
 
         # ---------------- Handle Empty Outputs ----------------
         if not agent_outputs and json_format:
@@ -967,6 +1034,14 @@ class AgentManager:
                 "response": {
                     "text": "I couldn't find any relevant information to answer your query.",
                     "json_format": None
+                }
+            }
+
+        if len(agent_outputs) == 1 and agent_outputs[0].get("agent") == "e2b_executor":
+            return {
+                "response": {
+                    "text": agent_outputs[0].get("content", ""),
+                    "json_format": json_format,
                 }
             }
 
@@ -1308,8 +1383,13 @@ class AgentManager:
         if resp_data and isinstance(resp_data, dict):
             output_text = resp_data.get("text", "")
             json_data = resp_data.get("json_format")
+            explicitly_failed = bool(resp_data.get("failed"))
             is_empty = not output_text and not json_data
-            has_error_msg = (isinstance(output_text, str) and output_text.startswith("Error:")) or state.get("error")
+            has_error_msg = (
+                explicitly_failed
+                or (isinstance(output_text, str) and output_text.startswith("Error:"))
+                or state.get("error")
+            )
             
             if is_empty or (has_error_msg and not json_data):
                 error_msg = state.get("error", output_text or "Agent returned no data.")

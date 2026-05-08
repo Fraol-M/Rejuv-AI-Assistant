@@ -12,7 +12,7 @@ from app.prompts.annotation_prompts import (
     SELECT_PROPERTY_VALUE_PROMPT,
     RESULT_SUMMARIZATION_PROMPT,
 )
-from app.socket_manager import emit_to_user
+from app.realtime import emit_to_user
 from .json_to_cypher import JsonToCypherConverter
 
 

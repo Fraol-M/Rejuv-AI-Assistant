@@ -28,6 +28,8 @@ Task:
 Rules:
 - Output ONLY raw Python code. No markdown fences, no explanation text.
 - Print a clear, human-readable summary of the results to stdout.
+- Prefer Python standard-library parsing for simple text formats before installing packages.
+- For VCF/FASTA/FASTQ/CSV/TSV quick summaries, do lightweight parsing directly unless the user explicitly asks for a specialized package/tool.
 - If generating plots (matplotlib/seaborn), call plt.show() — E2B captures them automatically.
 - If the task involves files that are not present, print a clear error and exit(1).
 - For subprocess calls, always capture stdout and stderr and print them.
@@ -35,6 +37,7 @@ Rules:
 - If the tool is missing, install it non-interactively at runtime inside the script, then verify the executable before continuing.
 - For PLINK tasks, support either `plink` or `plink2` and print which executable was used.
 - Save generated outputs under /home/user unless the task explicitly says otherwise, and print the output file paths you created.
+- End stdout with a compact "RESULT SUMMARY" section containing the main numbers, generated file paths, and caveats.
 """
 
 ERROR_SECTION = """Previous attempt failed — fix the issue in your new script:

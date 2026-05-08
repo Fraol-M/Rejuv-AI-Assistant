@@ -2,7 +2,7 @@
 from typing import Dict, Any, Tuple, Optional, List, Union
 from app.prompts.hypothesis_prompt import hypothesis_format_prompt,hypothesis_response
 from app.storage.redis import redis_manager
-from app.socket_manager import emit_to_user
+from app.realtime import emit_to_user
 import logging
 import os
 import difflib

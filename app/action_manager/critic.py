@@ -9,7 +9,7 @@ class CriticAgent:
 
     The only question asked: did the sandbox produce usable output?
     Tool-specific parsing (e.g. PLINK QC numbers) is handled downstream
-    by the LLM or by tool-specific parsers in app/e2b/tools/.
+    by the LLM or by tool-specific parsers in app/action_manager/tools/.
     """
 
     def validate(self, result: dict) -> tuple[bool, str]:

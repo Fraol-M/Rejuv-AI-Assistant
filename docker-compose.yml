@@ -1,4 +1,11 @@
 services:
+  action-sandbox:
+    build:
+      context: ./app/action_manager/docker_sandbox
+    image: rejuv-action-sandbox:latest
+    profiles:
+      - sandbox
+
   assistant:
     build: .
     env_file:
@@ -6,6 +13,7 @@ services:
     volumes:
       - .:/AI-Assistant:rw                 
       - ./logfiles:/AI-Assistant/logfiles 
+      - /var/run/docker.sock:/var/run/docker.sock
       - static:/static    
     ports:
       - "${FLASK_PORT}:${FLASK_PORT}"

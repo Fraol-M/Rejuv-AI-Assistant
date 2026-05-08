@@ -50,10 +50,10 @@ agent_descriptions = """
    - If any of these parameters are present in the session context, this agent should be included as the FIRST step to retrieve the data before other agents analyze it.
    - Do NOT include this agent if none of these parameters are present.
 
-8. **e2b_executor** [action track]: Executes bioinformatics tools inside a secure E2B cloud sandbox.
-   Use when the query requires running a command-line tool (e.g. PLINK, samtools) on genetic data files rather than querying a database or generating text.
-   Always place in a sequential group so the next informative step (biogpt_agent or _hypothesis_agent) can interpret the numeric results.
-   - Examples: "run PLINK QC on my GWAS data", "clean my genotype files", "filter variants by missingness rate", "apply MAF and HWE filters"
+8. **e2b_executor** [action track]: Executes code, scripts, package/API calls, plots, file transformations, and bioinformatics tools inside the action sandbox. The runtime prefers E2B and may fall back to local Docker when E2B is unavailable.
+   Use when the query requires doing work rather than only answering from memory/retrieval: compute statistics, parse uploaded data, run PLINK/samtools/bcftools, create plots, convert/filter files, call scientific APIs, download/process public data, or prepare structured intermediate outputs for another agent.
+   The action sandbox is the system's execution hand. Other agents may depend on its output when they need computed results, plots, cleaned files, or downloaded/processed evidence.
+   - Examples: "compute QC on this VCF", "plot expression from this CSV", "extract tables from this PDF", "download PubMed metadata and summarize counts", "filter FASTQ records", "run PLINK PCA"
 """
 
 VALIDATION_PROMPT = """You are a Gatekeeper for a specialized Biomedical & Bioinformatics AI.
@@ -63,14 +63,15 @@ Your sole job is to accept valid biological queries and reject irrelevant ones.
 We specialize ONLY in:
 1. **Biological Science** (Genes, proteins, diseases, drugs, mechanisms).
 2. **Bioinformatics Tools** (Galaxy, pipelines, algorithms *applied to biology*).
-3. **User Document Analysis** (Uploaded PDFs, specific data retrieval).
+3. **User Document/Data Analysis** (Uploaded PDFs, datasets, genotype files, sequence files, tables, and specific data retrieval).
+4. **Scientific Action Execution** (running code/tools/API calls when applied to biological or biomedical work).
 
 ## AGENT CAPABILITIES (What we DO):
 {agent_descriptions}
 
 ## OUT OF SCOPE (What we REJECT):
 - **General Technology**: "What is a neural network?", "What is an LLM?", "Explain Python classes", "How does Docker work?" (REJECT unless applied to biology).
-- **General Coding**: "Write a script", "Fix my code" (REJECT unless specifically for bioinformatics tasks like FASTA parsing).
+- **General Coding**: "Write a script", "Fix my code" (REJECT unless specifically for biomedical/bioinformatics/scientific data tasks like FASTA parsing, VCF QC, plotting biological data, or PubMed data processing).
 - **General Knowledge**: "Who is the president?", "History of Rome".
 - **Casual Chat**: "Hi", "How are you", "Tell me a joke" (Reject politely).
 
@@ -103,7 +104,9 @@ Your job is to organize agents into EXECUTION GROUPS that run either in PARALLEL
 3. **"Expert Chain" Rule**: If a query asks for *what* (database lookup) and then needs that result for *why* (mechanism explanation), chain them SEQUENTIALLY: `annotation_agent` → `biogpt_agent`.
 4. **"Analysis Pipeline" Rule**: If a query asks for tools to process specific data, chain `annotation_agent` (to find data type) → `galaxy_agent` (to find tools for that data) SEQUENTIALLY.
 5. **"Dependency" Rule**: Within a sequential group, if Step B uses the result of Step A, set `"dependency": [ID of Step A]`. In a parallel group, all steps either have NO dependency or depend on a step from a PREVIOUS group.
-6. **"Action Step" Rule**: If a query requires executing a bioinformatics tool (PLINK, samtools, custom scripts) rather than querying a database or generating text, assign that step to `e2b_executor`. Action steps produce numeric output or files. Always place them in a sequential group followed by a `biogpt_agent` or `_hypothesis_agent` step to interpret the results.
+6. **"Action Step" Rule**: If a query requires computation, tool use, plotting, file conversion/filtering, API calls, downloads, or custom scripts, assign that work to `e2b_executor` with `"track": "action"`. Action steps produce stdout, plots, structured summaries, or files.
+7. **"Action Dependency" Rule**: If the user asks for interpretation after an action (biological significance, clinical meaning, hypothesis, explanation), chain the relevant informative agent after `e2b_executor` and set its dependency to the E2B step. If the user only asks for the computed result or generated file/plot, E2B alone is enough.
+8. **"Tool Recommendation vs Tool Execution" Rule**: Use `galaxy_agent` when the user asks which tool/workflow to use. Use `e2b_executor` when the user asks the system to actually run, compute, filter, plot, convert, download, or process something.
 
 ## Agent Capabilities:
 {agent_descriptions}
@@ -198,6 +201,56 @@ Plan:
   "reasoning": "Simple knowledge question, only BioGPT needed."
 }}
 
+### Example 5: ACTION ONLY — compute from uploaded data
+Query: "Compute a quick QC summary for this uploaded VCF"
+Plan:
+{{
+  "execution_groups": [
+    {{
+      "group_id": 1,
+      "mode": "sequential",
+      "steps": [
+        {{"id": 1, "agent": "e2b_executor", "input": "Compute sample count, variant count, missing genotype count, and missingness for the uploaded VCF. Print a concise QC summary.", "dependency": null, "track": "action"}}
+      ]
+    }}
+  ],
+  "reasoning": "The user requested computation on an uploaded file, so E2B should execute the analysis directly."
+}}
+
+### Example 6: ACTION THEN INTERPRET — computed results feed expert explanation
+Query: "Run QC on this VCF and explain whether the results look suitable for downstream association analysis"
+Plan:
+{{
+  "execution_groups": [
+    {{
+      "group_id": 1,
+      "mode": "sequential",
+      "steps": [
+        {{"id": 1, "agent": "e2b_executor", "input": "Run QC on the uploaded VCF and print sample count, variant count, missingness, and any obvious data quality warnings.", "dependency": null, "track": "action"}},
+        {{"id": 2, "agent": "biogpt_agent", "input": "Interpret the QC results for downstream association analysis.", "dependency": [1], "track": "informative"}}
+      ]
+    }}
+  ],
+  "reasoning": "E2B computes the QC metrics; BioGPT interprets the implications."
+}}
+
+### Example 7: ACTION THEN RAG — data preparation before document-grounded answer
+Query: "Extract tables from this uploaded biomedical PDF and summarize the dosage findings"
+Plan:
+{{
+  "execution_groups": [
+    {{
+      "group_id": 1,
+      "mode": "sequential",
+      "steps": [
+        {{"id": 1, "agent": "e2b_executor", "input": "Extract tables from the uploaded PDF and print the relevant dosage rows as structured text.", "dependency": null, "track": "action"}},
+        {{"id": 2, "agent": "rag_agent", "input": "Summarize the dosage findings using the extracted table content.", "dependency": [1], "track": "informative"}}
+      ]
+    }}
+  ],
+  "reasoning": "E2B performs file/table extraction; RAG summarizes the extracted evidence."
+}}
+
 ## Output Format:
 {{
     "execution_groups": [
@@ -209,7 +262,8 @@ Plan:
                     "id": number,
                     "agent": "agent_name",
                     "input": "Refined query for this agent using [result from step X] notation if needed",
-                    "dependency": [id_list] or null
+                    "dependency": [id_list] or null,
+                    "track": "action" or "informative"
                 }}
             ]
         }}

@@ -21,6 +21,7 @@ COPY . /AI-Assistant
 
 # Install dependencies 
 RUN poetry config virtualenvs.create false && \
+    poetry lock --no-interaction && \
     for i in 1 2 3; do \
       if poetry install --no-root --no-interaction; then \
         break; \
@@ -32,7 +33,7 @@ RUN poetry config virtualenvs.create false && \
       echo "poetry install failed (attempt $i), retrying in 20s..."; \
       sleep 20; \
     done && \
-    python -m pip install --no-cache-dir gunicorn e2b-code-interpreter
+    python -m pip install --no-cache-dir gunicorn e2b-code-interpreter docker
 
 # Run the application
 CMD ["gunicorn", "-w", "4", "--bind", "0.0.0.0:$FLASK_PORT", "run:app"]

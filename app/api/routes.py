@@ -7,8 +7,8 @@ import os
 from ..agent_hub.rag.utils.tts_utils import tts_manager
 from ..storage.redis import redis_manager
 from ..storage.mongo_storage import mongo_db_manager
-from ..e2b.session_manager import session_manager
-from ..e2b.upload_manager import is_genotype_file, save_uploaded_genotype_file
+from ..action_manager.session_manager import session_manager
+from ..action_manager.upload_manager import is_action_file, save_uploaded_action_file
 
 load_dotenv()
 main_bp = Blueprint("main", __name__)
@@ -100,10 +100,20 @@ def process_query(current_user_id, auth_token):
                         [cid.strip() for cid in context_id.split(",") if cid.strip()]
                     )
 
+        def _looks_like_action_query(text):
+            action_words = (
+                "run", "compute", "calculate", "plot", "chart", "qc", "quality control",
+                "filter", "clean", "convert", "extract table", "parse", "summarize file",
+                "plink", "samtools", "bcftools", "pysam", "statistics", "stats",
+            )
+            text = (text or "").lower()
+            return any(word in text for word in action_words)
+
         # Handle file uploads
         upload_results = []
         newly_uploaded_content_ids = []
-        genotype_uploads = []
+        action_uploads = []
+        should_stage_pdfs_for_action = _looks_like_action_query(question)
 
         if uploaded_files:
             for uploaded in uploaded_files:
@@ -121,14 +131,18 @@ def process_query(current_user_id, auth_token):
                             if new_id:
                                 newly_uploaded_content_ids.extend(_flatten_to_strings(new_id))
                         upload_results.append({"filename": uploaded.filename, "response": response})
-                elif is_genotype_file(uploaded.filename):
-                    file_meta = save_uploaded_genotype_file(uploaded, user_id)
-                    genotype_uploads.append(file_meta)
+                    if should_stage_pdfs_for_action:
+                        uploaded.stream.seek(0)
+                        file_meta = save_uploaded_action_file(uploaded, user_id)
+                        action_uploads.append(file_meta)
+                elif is_action_file(uploaded.filename):
+                    file_meta = save_uploaded_action_file(uploaded, user_id)
+                    action_uploads.append(file_meta)
                     upload_results.append(
                         {
                             "filename": file_meta["filename"],
                             "response": {
-                                "text": "Genotype file staged for E2B sandbox use.",
+                                "text": "File staged for E2B sandbox use.",
                                 "sandbox_path": file_meta["sandbox_path"],
                             },
                         }
@@ -137,8 +151,8 @@ def process_query(current_user_id, auth_token):
             # Merge content_ids
             if newly_uploaded_content_ids:
                 content_ids = (content_ids or []) + newly_uploaded_content_ids
-            if genotype_uploads:
-                session_manager.register_uploaded_files(user_id, genotype_uploads)
+            if action_uploads:
+                session_manager.register_uploaded_files(user_id, action_uploads)
 
         # Ensure query exists before processing
         if not question and not json_query:
