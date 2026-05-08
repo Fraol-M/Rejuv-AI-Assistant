@@ -46,9 +46,14 @@ agent_descriptions = """
 6. **_hypothesis_agent**: Research theorist. Generates testable scientific hypotheses and future research directions based on findings from other agents.
 
 7. **content_retrieval_agent** [context-dependent]: Retrieves graph or document data from external backends when specific parameters are available.
-  - active_when: graph_id is set (queries annotation/hypothesis APIs and returns graph), graph payload is provided directly in request context, content_ids are set (retrieves user uploaded PDFs/web content), urls are set (fetches and indexes HTML content)
+  - active_when: graph_id is set (queries annotation/hypothesis APIs and returns graph), content_ids are set (retrieves user uploaded PDFs/web content), urls are set (fetches and indexes HTML content)
    - If any of these parameters are present in the session context, this agent should be included as the FIRST step to retrieve the data before other agents analyze it.
    - Do NOT include this agent if none of these parameters are present.
+
+8. **e2b_executor** [action track]: Executes bioinformatics tools inside a secure E2B cloud sandbox.
+   Use when the query requires running a command-line tool (e.g. PLINK, samtools) on genetic data files rather than querying a database or generating text.
+   Always place in a sequential group so the next informative step (biogpt_agent or _hypothesis_agent) can interpret the numeric results.
+   - Examples: "run PLINK QC on my GWAS data", "clean my genotype files", "filter variants by missingness rate", "apply MAF and HWE filters"
 """
 
 VALIDATION_PROMPT = """You are a Gatekeeper for a specialized Biomedical & Bioinformatics AI.
@@ -73,6 +78,9 @@ We specialize ONLY in:
 - Query: "What is a neural network?" -> **INVALID** (Too general).
 - Query: "How are neural networks used in protein folding?" -> **VALID** (Applied to biology).
 
+## USER QUERY TO CLASSIFY:
+{query}
+
 ## Output Format (JSON only):
 {{
     "is_valid": boolean,
@@ -95,6 +103,7 @@ Your job is to organize agents into EXECUTION GROUPS that run either in PARALLEL
 3. **"Expert Chain" Rule**: If a query asks for *what* (database lookup) and then needs that result for *why* (mechanism explanation), chain them SEQUENTIALLY: `annotation_agent` → `biogpt_agent`.
 4. **"Analysis Pipeline" Rule**: If a query asks for tools to process specific data, chain `annotation_agent` (to find data type) → `galaxy_agent` (to find tools for that data) SEQUENTIALLY.
 5. **"Dependency" Rule**: Within a sequential group, if Step B uses the result of Step A, set `"dependency": [ID of Step A]`. In a parallel group, all steps either have NO dependency or depend on a step from a PREVIOUS group.
+6. **"Action Step" Rule**: If a query requires executing a bioinformatics tool (PLINK, samtools, custom scripts) rather than querying a database or generating text, assign that step to `e2b_executor`. Action steps produce numeric output or files. Always place them in a sequential group followed by a `biogpt_agent` or `_hypothesis_agent` step to interpret the results.
 
 ## Agent Capabilities:
 {agent_descriptions}

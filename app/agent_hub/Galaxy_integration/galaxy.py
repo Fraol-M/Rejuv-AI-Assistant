@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import traceback
-from app.Galaxy_integration.galaxy_content_clean import HTMLProcessor
+from app.agent_hub.Galaxy_integration.galaxy_content_clean import HTMLProcessor
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_google_genai import ChatGoogleGenerativeAI
 import os

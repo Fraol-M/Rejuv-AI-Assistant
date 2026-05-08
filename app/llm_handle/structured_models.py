@@ -33,6 +33,10 @@ class ExecutionStep(BaseModel):
         default=None,
         description="IDs of steps this step depends on"
     )
+    track: Optional[str] = Field(
+        default="informative",
+        description="'informative' for existing agents, 'action' for E2B sandbox execution"
+    )
 
 
 class ExecutionGroup(BaseModel):

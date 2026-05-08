@@ -1,36 +1,29 @@
-import os
-from datetime import datetime
 import json
-import yaml
 import logging
+import os
+import traceback
+
+import yaml
 from dotenv import load_dotenv
 from flask import Flask
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from .routes import main_bp
-from app.main import AiAssistance
-from app.rag.rag import RAG
-from app.socket_manager import init_socketio
-from app.storage.qdrant import Qdrant
-from app.storage.mongo_storage import MongoManager
-from app.annotation_graph.schema_handler import SchemaHandler
-from app.llm_handle.llm_models import (
-    get_llm_model,
-    sentence_transformer_embedding_model,
+from .agent_hub.annotation_graph.schema_handler import SchemaHandler
+from .agent_hub.rag.rag import RAG
+from .api import main_bp
+from .core import AiAssistance
+from .llm_handle.llm_models import (
     gemini_embedding_model,
-    openai_embedding_model,
     get_embedding_vector_size,
+    get_llm_model,
+    openai_embedding_model,
+    sentence_transformer_embedding_model,
 )
-from app.storage.qdrant import Qdrant
-from app.main import AiAssistance
-from app.rag.rag import RAG
-from .routes import main_bp
-import os
-import yaml
-import json
-import traceback
+from .realtime import init_socketio
+from .storage.mongo_storage import MongoManager
+from .storage.qdrant import Qdrant
 
 # Configure logging
 logging.basicConfig(

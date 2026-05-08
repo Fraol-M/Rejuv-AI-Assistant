@@ -50,6 +50,7 @@ langchain = "^1.0.8"
 langchain-core = "^1.0.7"
 langgraph = "^1.0.3"
 langchain-openai = "^0.3.0"
+e2b-code-interpreter = "*"
 
 # Explicitly add rich with a compatible version for flask-limiter
 rich = ">=13.0.0,<14.0.0"
