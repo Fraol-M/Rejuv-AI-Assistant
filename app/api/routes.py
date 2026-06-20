@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import traceback
 import json
 import os
+import time
 from ..agent_hub.rag.utils.tts_utils import tts_manager
 from ..storage.redis import redis_manager
 from ..storage.mongo_storage import mongo_db_manager
@@ -544,6 +545,82 @@ def get_faq_answer(question_id):
         return jsonify({"error": str(e)}), 500
 
 
-@main_bp.route("/", methods=["GET"])
+def _service_check(check_fn):
+    started_at = time.time()
+    try:
+        details = check_fn() or {}
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        return {"status": "ok", "latency_ms": elapsed_ms, **details}
+    except Exception as exc:
+        elapsed_ms = int((time.time() - started_at) * 1000)
+        return {
+            "status": "error",
+            "latency_ms": elapsed_ms,
+            "error": str(exc),
+        }
+
+
+def _check_neo4j():
+    ai_assistant = current_app.config.get("ai_assistant")
+    if not ai_assistant:
+        raise RuntimeError("AI assistant is not initialized")
+
+    driver = ai_assistant.agents.annotation_graph.neo4j.get_driver()
+    with driver.session() as session:
+        result = session.run("RETURN 1 AS ok")
+        if result.single()["ok"] != 1:
+            raise RuntimeError("Unexpected Neo4j ping response")
+    return {}
+
+
+def _check_mongo():
+    manager = current_app.config.get("mongo_db_manager") or mongo_db_manager
+    manager.client.admin.command("ping")
+    return {"database": manager.db.name if manager.db is not None else None}
+
+
+def _check_qdrant():
+    qdrant_client = current_app.config.get("qdrant_client")
+    if not qdrant_client:
+        raise RuntimeError("Qdrant client is not initialized")
+
+    collections = qdrant_client.client.get_collections()
+    count = len(getattr(collections, "collections", []) or [])
+    return {"collections": count}
+
+
+def _check_redis():
+    if not redis_manager.is_available:
+        raise RuntimeError("Redis client is not available")
+
+    client = redis_manager.client
+    if client is None or not client.ping():
+        raise RuntimeError("Redis ping failed")
+    return {}
+
+
+@main_bp.route("/health", methods=["GET"])
 def health_check():
-    return jsonify("This is health check")
+    services = {
+        "neo4j": _service_check(_check_neo4j),
+        "mongodb": _service_check(_check_mongo),
+        "qdrant": _service_check(_check_qdrant),
+        "redis": _service_check(_check_redis),
+    }
+    healthy = all(service["status"] == "ok" for service in services.values())
+    status_code = 200 if healthy else 503
+
+    return (
+        jsonify(
+            {
+                "status": "ok" if healthy else "degraded",
+                "services": services,
+            }
+        ),
+        status_code,
+    )
+
+
+@main_bp.route("/", methods=["GET"])
+def root_health_check():
+    return health_check()
