@@ -21,6 +21,11 @@ from sentence_transformers import SentenceTransformer
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.language_models import BaseChatModel
+from app.utils.langsmith_tracking import (
+    current_usage_tracker,
+    extract_usage_metadata,
+    normalize_usage,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -169,6 +174,16 @@ class LangChainLLM(LLMInterface):
             f"retries={max_retries}, fallback={'yes' if fallback_model else 'no'}"
         )
 
+    @property
+    def model_name(self) -> str:
+        return str(
+            getattr(
+                self._base_model,
+                "model_name",
+                getattr(self._base_model, "model", "unknown"),
+            )
+        )
+
     def generate(self, prompt: str, system_prompt: str = None, **kwargs) -> Any:
         """
         Backward-compatible generate method.
@@ -184,9 +199,34 @@ class LangChainLLM(LLMInterface):
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
 
+        tracker = current_usage_tracker()
+        config = (
+            tracker.langsmith_config(
+                provider=self.model_provider,
+                model=self.model_name,
+                operation="generate",
+            )
+            if tracker
+            else None
+        )
+        started_at = time.time()
+
         try:
-            response = self.chat_model.invoke(messages)
+            response = self.chat_model.invoke(messages, config=config)
             content = response.content if hasattr(response, 'content') else str(response)
+            if tracker:
+                usage = normalize_usage(
+                    extract_usage_metadata(response),
+                    prompt_text="\n".join(str(message.content) for message in messages),
+                    completion_text=content,
+                )
+                tracker.record_llm_call(
+                    provider=self.model_provider,
+                    model=self.model_name,
+                    operation="generate",
+                    usage=usage,
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                )
 
             # Try to extract JSON from code blocks (preserving original behavior)
             json_content = self._extract_json_from_codeblock(content)
@@ -196,6 +236,20 @@ class LangChainLLM(LLMInterface):
                 return json_content
 
         except Exception as e:
+            if tracker:
+                usage = normalize_usage(
+                    None,
+                    prompt_text="\n".join(str(message.content) for message in messages),
+                    completion_text="",
+                )
+                tracker.record_llm_call(
+                    provider=self.model_provider,
+                    model=self.model_name,
+                    operation="generate",
+                    usage=usage,
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                    error=str(e),
+                )
             logger.error(f"LLM generation failed after {self._max_retries} retries: {e}")
             raise
 
@@ -224,6 +278,19 @@ class LangChainLLM(LLMInterface):
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
 
+        tracker = current_usage_tracker()
+        config = (
+            tracker.langsmith_config(
+                provider=self.model_provider,
+                model=self.model_name,
+                operation=f"generate_structured:{output_schema.__name__}",
+            )
+            if tracker
+            else None
+        )
+        started_at = time.time()
+        prompt_text = "\n".join(str(message.content) for message in messages)
+
         try:
             # Try native structured output first (supported by Gemini and OpenAI)
             structured_model = self._base_model.with_structured_output(output_schema)
@@ -234,7 +301,25 @@ class LangChainLLM(LLMInterface):
                 retry_if_exception_type=(Exception,),
             )
 
-            result = structured_with_retry.invoke(messages)
+            result = structured_with_retry.invoke(messages, config=config)
+            if tracker:
+                completion_text = (
+                    result.model_dump_json()
+                    if hasattr(result, "model_dump_json")
+                    else str(result)
+                )
+                usage = normalize_usage(
+                    None,
+                    prompt_text=prompt_text,
+                    completion_text=completion_text,
+                )
+                tracker.record_llm_call(
+                    provider=self.model_provider,
+                    model=self.model_name,
+                    operation=f"generate_structured:{output_schema.__name__}",
+                    usage=usage,
+                    elapsed_ms=int((time.time() - started_at) * 1000),
+                )
             logger.info(f"Structured output parsed successfully: {type(result).__name__}")
             return result
 

@@ -16,7 +16,13 @@ import os
 import logging
 import logging.handlers as loghandlers
 from .agent_manager import AgentManager, AgentState
-from ..utils import RichLogger, safe_agent_node
+from ..utils import (
+    RichLogger,
+    llm_usage_step,
+    safe_agent_node,
+    start_query_tracking,
+    tracked_node,
+)
 
 logger = logging.getLogger(__name__)
 log_dir = "/AI-Assistant/logfiles"
@@ -74,41 +80,41 @@ class AiAssistance:
 
         workflow = StateGraph(AgentState)
 
-        workflow.add_node("classifier", self.agents.classify_query)
-        workflow.add_node("increment_step", self.increment_step)
+        workflow.add_node("classifier", tracked_node("classifier", self.agents.classify_query))
+        workflow.add_node("increment_step", tracked_node("increment_step", self.increment_step))
         
         # Wrap agent nodes with error recovery (retry + graceful degradation)
-        workflow.add_node("annotation_agent", safe_agent_node(
+        workflow.add_node("annotation_agent", tracked_node("annotation_agent", safe_agent_node(
             self.agents.annotation_agent, "Annotation Agent",
             max_retries=2, response_key="annotation_response"
-        ))
-        workflow.add_node("rag_agent", safe_agent_node(
+        )))
+        workflow.add_node("rag_agent", tracked_node("rag_agent", safe_agent_node(
             self.agents.rag_agent, "RAG Agent",
             max_retries=2, response_key="rag_response"
-        ))
-        workflow.add_node("galaxy_agent", safe_agent_node(
+        )))
+        workflow.add_node("galaxy_agent", tracked_node("galaxy_agent", safe_agent_node(
             self.agents.galaxy_agent, "Galaxy Agent",
             max_retries=2, response_key="galaxy_response"
-        ))
-        workflow.add_node("biogpt_agent", safe_agent_node(
+        )))
+        workflow.add_node("biogpt_agent", tracked_node("biogpt_agent", safe_agent_node(
             self.agents.biogpt_agent, "BioGPT Agent",
             max_retries=2, response_key="biogpt_response"
-        ))
-        workflow.add_node("content_retrieval_agent", safe_agent_node(
+        )))
+        workflow.add_node("content_retrieval_agent", tracked_node("content_retrieval_agent", safe_agent_node(
             self.agents.content_retrieval_agent, "Content Retrieval Agent",
             max_retries=2, response_key="content_retrieval_response"
-        ))
-        workflow.add_node("_hypothesis_agent", safe_agent_node(
+        )))
+        workflow.add_node("_hypothesis_agent", tracked_node("_hypothesis_agent", safe_agent_node(
             self.agents.hypothesis_agent, "Hypothesis Agent",
             max_retries=1, response_key=None
-        ))
-        workflow.add_node("e2b_executor", safe_agent_node(
+        )))
+        workflow.add_node("e2b_executor", tracked_node("e2b_executor", safe_agent_node(
             self.agents.e2b_executor, "E2B Executor",
             max_retries=1, response_key="e2b_response"
-        ))
+        )))
 
-        workflow.add_node("aggregator", self.agents.aggregate_responses)
-        workflow.add_node("finalizer", self.agents.finalize_response)
+        workflow.add_node("aggregator", tracked_node("aggregator", self.agents.aggregate_responses))
+        workflow.add_node("finalizer", tracked_node("finalizer", self.agents.finalize_response))
 
         workflow.set_entry_point("classifier")
         
@@ -154,6 +160,15 @@ class AiAssistance:
     def increment_step(self, state: AgentState) -> Dict[str, Any]:
         """Wrap the step update"""
         return self.agents.update_step_state(state)
+
+    @staticmethod
+    def _attach_usage(response: Dict[str, Any], usage_tracker) -> Dict[str, Any]:
+        if usage_tracker is None:
+            return response
+        if not isinstance(response, dict):
+            response = {"text": str(response), "json_format": None}
+        response["usage"] = usage_tracker.as_dict()
+        return response
 
     def _route_to_agents(self, state: AgentState):
         """
@@ -329,109 +344,136 @@ class AiAssistance:
         Main entry point for assistant responses.
         Routes to agent execution system.
         """
+        usage_tracker = None
         try:
-            RichLogger.log_workflow_start(query)
-            
-            try:
-                user_information = self.store.get_context_and_memory(user_id)
-                history = []
-                memory = []
-                for item in user_information:
-                    q = item["QUESTION"]["question"]
-                    c = item["QUESTION"]["context"]
-                    m = item["MEMORIES"]
-                    history.append({"question": q, "context": c})
-                    memory.append(m)
-            except Exception as e:
-                history = []
-                memory = []
-
-            logger.info(f"Histories of the user are: {history} and memories are {memory}")
-            RichLogger.log_history_and_memory(history, memory)
-
-            prompt = conversation_prompt.format(
-                memory=memory,
+            with start_query_tracking(
+                user_id=user_id,
                 query=query,
-                conversation_history=history,
-            )
-            logger.info("Advanced llm response")
-            response = self.advanced_llm.generate(prompt)
-            logger.info(f"Response from the advanced LLM: {response}")
-            emit_to_user(user=user_id, message="Analyzing...")
-            
-            if response:
-                if "response:" in response:
-                    result = response.split("response:")[1].strip()
-                    final_response = result.strip('"')
-                    
+                metadata={
+                    "graph_id": graph_id,
+                    "content_ids": content_ids,
+                    "urls": urls,
+                    "resource": resource,
+                },
+            ) as usage_tracker:
+                RichLogger.log_workflow_start(query)
+
+                try:
+                    user_information = self.store.get_context_and_memory(user_id)
+                    history = []
+                    memory = []
+                    for item in user_information:
+                        q = item["QUESTION"]["question"]
+                        c = item["QUESTION"]["context"]
+                        m = item["MEMORIES"]
+                        history.append({"question": q, "context": c})
+                        memory.append(m)
+                except Exception as e:
+                    history = []
+                    memory = []
+
+                logger.info(f"Histories of the user are: {history} and memories are {memory}")
+                RichLogger.log_history_and_memory(history, memory)
+
+                prompt = conversation_prompt.format(
+                    memory=memory,
+                    query=query,
+                    conversation_history=history,
+                )
+                logger.info("Advanced llm response")
+                with llm_usage_step("conversation_handler"):
+                    response = self.advanced_llm.generate(prompt)
+                logger.info(f"Response from the advanced LLM: {response}")
+                emit_to_user(user=user_id, message="Analyzing...")
+
+                if response:
+                    if "response:" in response:
+                        result = response.split("response:")[1].strip()
+                        final_response = result.strip('"')
+
+                        self.store.create_history(
+                            user_id=user_id,
+                            user_message=query,
+                            assistant_answer=final_response,
+                            graph_id_referenced=graph_id,
+                            content_ids=content_ids,
+                            urls=urls,
+                            agents_used=[],
+                        )
+
+                        final_payload = self._attach_usage(
+                            {"text": final_response}, usage_tracker
+                        )
+                        emit_to_user(user=user_id, message=final_payload, status="completed")
+                        return final_payload
+
+                    elif "question:" in response:
+                        refactored_question = response.split("question:")[1].strip()
+
+                        agent_response = self.agent(
+                            refactored_question,
+                            user_id,
+                            token,
+                            content_ids=content_ids,
+                            graph_id=graph_id,
+                            urls=urls,
+                            resource=resource,
+                        )
+
+                        if isinstance(agent_response, str):
+                            agent_response = {"text": agent_response, "agents_completed": []}
+                        elif not isinstance(agent_response, dict):
+                            agent_response = {"text": str(agent_response), "agents_completed": []}
+
+                        resource_type = agent_response.get("resource", {}).get("type")
+                        if resource_type:
+                            logger.info(f"Resource successfully created: {resource_type}")
+
+                        assistant_answer = agent_response.get("text", str(agent_response))
+
+                        agents_used = agent_response.get("agents_completed", [])
+
+                        self.store.create_history(
+                            user_id=user_id,
+                            user_message=query,
+                            assistant_answer=assistant_answer,
+                            graph_id_referenced=graph_id,
+                            content_ids=content_ids,
+                            urls=urls,
+                            agents_used=agents_used,
+                        )
+
+                        agent_response = self._attach_usage(agent_response, usage_tracker)
+                        emit_to_user(user=user_id, message=agent_response, status="completed")
+                        return agent_response
+
+                else:
+                    logger.error("No response generated from LLM")
+                    error_msg = "I apologize, but I encountered an error while processing your request."
+
                     self.store.create_history(
                         user_id=user_id,
                         user_message=query,
-                        assistant_answer=final_response,
+                        assistant_answer=error_msg,
                         graph_id_referenced=graph_id,
                         content_ids=content_ids,
                         urls=urls,
-                        agents_used=[],  
+                        agents_used=[],
                     )
-                    
-                    emit_to_user(user=user_id, message=final_response, status="completed")
-                    return {"text": final_response}
 
-                elif "question:" in response:
-                    refactored_question = response.split("question:")[1].strip()
-                    
-                    agent_response = self.agent(
-                        refactored_question,
-                        user_id,
-                        token,
-                        content_ids=content_ids,
-                        graph_id=graph_id,
-                        urls=urls,
-                        resource=resource,
-                    )
-                    
-                    if isinstance(agent_response, str):
-                        agent_response = {"text": agent_response, "agents_completed": []}
-                    elif not isinstance(agent_response, dict):
-                        agent_response = {"text": str(agent_response), "agents_completed": []}
+                    error_payload = self._attach_usage({"text": error_msg}, usage_tracker)
+                    emit_to_user(user=user_id, message=error_payload, status="completed")
+                    return error_payload
 
-                    resource_type = agent_response.get("resource", {}).get("type")
-                    if resource_type:
-                        logger.info(f"Resource successfully created: {resource_type}")
-
-                    assistant_answer = agent_response.get("text", str(agent_response))
-                    
-                    agents_used = agent_response.get("agents_completed", [])
-                    
-                    self.store.create_history(
-                        user_id=user_id,
-                        user_message=query,  
-                        assistant_answer=assistant_answer,
-                        graph_id_referenced=graph_id,
-                        content_ids=content_ids,
-                        urls=urls,
-                        agents_used=agents_used,
-                    )
-                    
-                    emit_to_user(user=user_id, message=agent_response, status="completed")
-                    return agent_response
-                    
-            else:
-                logger.error("No response generated from LLM")
-                error_msg = "I apologize, but I encountered an error while processing your request."
-                
-                self.store.create_history(
-                    user_id=user_id,
-                    user_message=query,
-                    assistant_answer=error_msg,
-                    graph_id_referenced=graph_id,
-                    content_ids=content_ids,
-                    urls=urls,
-                    agents_used=[],
+                fallback_payload = self._attach_usage(
+                    {
+                        "text": "I apologize, but I couldn't determine how to process your request.",
+                        "json_format": None,
+                    },
+                    usage_tracker,
                 )
-                
-                emit_to_user(user=user_id, message={"text": error_msg}, status="completed")
-                return {"text": error_msg}
+                emit_to_user(user=user_id, message=fallback_payload, status="completed")
+                return fallback_payload
         
         except Exception as e:
             logger.error(f"Error in assistant_response: {e}", exc_info=True)
@@ -450,7 +492,7 @@ class AiAssistance:
             except Exception as save_error:
                 logger.error(f"Failed to save error history: {save_error}")
             
-            return {
+            return self._attach_usage({
                 "text": error_msg,
                 "json_format": None
-            }
+            }, usage_tracker)
